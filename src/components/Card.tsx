@@ -8,10 +8,10 @@ interface CardProps extends HTMLAttributes<HTMLDivElement> {
 const Card = forwardRef<HTMLDivElement, CardProps>(
   ({ className, variant = 'glass', ...props }, ref) => {
     const variants = {
-      glass: "glass-panel bg-slate-dark/40 border-cyan/20",
-      outline: "bg-transparent border border-cyan/30 rounded-xl",
-      ember: "bg-ember/10 border border-ember/30 rounded-xl",
-      surface: "bg-surface-container rounded-3xl p-4",
+      glass: "glass-panel",
+      outline: "bg-white border border-outline-variant rounded-xl shadow-sm",
+      ember: "bg-error-container/30 border border-error/30 rounded-xl",
+      surface: "bg-white rounded-3xl p-4 border border-outline-variant shadow-sm",
     };
 
     return (

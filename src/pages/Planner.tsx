@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { motion } from "motion/react";
 import { 
   MapPin, 
@@ -36,6 +37,28 @@ import { generateSurvivalPlan } from "../services/geminiService";
 import { cn } from "../lib/utils";
 import { AnimatePresence } from "motion/react";
 
+type FormField =
+  | "location"
+  | "credits"
+  | "extractionTime"
+  | "energyLevel"
+  | "priorities"
+  | "priorityDetails"
+  | "tacticalNuances";
+
+type FormErrors = Partial<Record<FormField, string>>;
+type LocationValidationStatus = "idle" | "validating" | "valid" | "invalid";
+
+interface ParsedCoordinates {
+  lat: number;
+  lng: number;
+}
+
+interface LocationSuggestion {
+  label: string;
+  value: string;
+}
+
 const priorityOptions = [
   { id: 'food', label: 'Food', icon: 'restaurant', description: 'Focuses on locating sustenance, identifying edible local flora/fauna, or finding the nearest reliable supply points.' },
   { id: 'shelter', label: 'Shelter', icon: 'home', description: 'Prioritizes finding or creating a secure place to sleep and stay protected from environmental elements (weather, temperature).' },
@@ -46,6 +69,34 @@ const priorityOptions = [
   { id: 'route', label: 'Route', icon: 'route', description: 'Focuses on navigation and movement. It calculates the safest or most efficient paths between your current location and your next objective.' },
   { id: 'tools', label: 'Tools', icon: 'build', description: 'Prioritizes gear maintenance and resourcefulness—finding hardware, repair shops, or creative ways to use your existing equipment.' },
 ];
+
+function parseCoordinates(location: string): ParsedCoordinates | null {
+  const trimmed = location.trim();
+
+  const labelled = trimmed.match(/lat[:\s]+(-?\d+(?:\.\d+)?)\s*[, ]+\s*lon[g]?[:\s]+(-?\d+(?:\.\d+)?)/i);
+  const plain = trimmed.match(/^(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)$/);
+  const lat = Number(labelled?.[1] ?? plain?.[1]);
+  const lng = Number(labelled?.[2] ?? plain?.[2]);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return null;
+  }
+  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+    return null;
+  }
+  return { lat, lng };
+}
+
+function reverseLabelFromNominatim(data: any): string {
+  const addr = data?.address ?? {};
+  const city = addr.city || addr.town || addr.village || addr.hamlet || addr.suburb;
+  const state = addr.state || addr.region;
+  const country = addr.country;
+  const parts = [city, state, country].filter(Boolean);
+  if (parts.length > 0) {
+    return parts.join(", ");
+  }
+  return data?.display_name || "";
+}
 
 export default function Planner() {
   const navigate = useNavigate();
@@ -59,10 +110,21 @@ export default function Planner() {
   }, []);
 
   const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [submitError, setSubmitError] = useState<string | null>(null);
   const [hoveredPriority, setHoveredPriority] = useState<string | null>(null);
   const [activeAdvancedPriority, setActiveAdvancedPriority] = useState<string | null>(null);
   const [isDetecting, setIsDetecting] = useState(false);
+  const [locationStatus, setLocationStatus] = useState<LocationValidationStatus>("idle");
+  const [locationStatusText, setLocationStatusText] = useState("");
+  const [formErrors, setFormErrors] = useState<FormErrors>({});
+  const validationRequestId = useRef(0);
+  const locationSuggestAbortRef = useRef<AbortController | null>(null);
+  const locationSuggestBoxRef = useRef<HTMLDivElement | null>(null);
+  const [lastValidatedLocation, setLastValidatedLocation] = useState("");
+  const [locationSuggestions, setLocationSuggestions] = useState<LocationSuggestion[]>([]);
+  const [isSuggestingLocation, setIsSuggestingLocation] = useState(false);
+  const [isLocationSuggestionOpen, setIsLocationSuggestionOpen] = useState(false);
+  const [locationStatusAnimTick, setLocationStatusAnimTick] = useState(0);
   const [input, setInput] = useState<SurvivalInput>({
     location: 'Sector 7G - Urban Ruins',
     credits: 250,
@@ -72,27 +134,288 @@ export default function Planner() {
     priorityDetails: {},
     tacticalNuances: '',
   });
+  const locationVisualStatus = formErrors.location || locationStatus === "invalid"
+    ? "invalid"
+    : locationStatus === "valid"
+      ? "valid"
+      : "default";
+  const previousLocationVisualStatus = useRef(locationVisualStatus);
+  const locationIconClass = locationVisualStatus === "invalid"
+    ? "text-error"
+    : locationVisualStatus === "valid"
+      ? "text-green-600"
+      : "text-primary";
+
+  useEffect(() => {
+    if (!activeAdvancedPriority) {
+      return;
+    }
+
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+
+    return () => {
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [activeAdvancedPriority]);
+
+  useEffect(() => {
+    if (previousLocationVisualStatus.current !== locationVisualStatus) {
+      setLocationStatusAnimTick((prev) => prev + 1);
+      previousLocationVisualStatus.current = locationVisualStatus;
+    }
+  }, [locationVisualStatus]);
+
+  useEffect(() => {
+    const onClickOutside = (event: MouseEvent) => {
+      if (!locationSuggestBoxRef.current) {
+        return;
+      }
+      if (!locationSuggestBoxRef.current.contains(event.target as Node)) {
+        setIsLocationSuggestionOpen(false);
+      }
+    };
+
+    document.addEventListener("mousedown", onClickOutside);
+    return () => document.removeEventListener("mousedown", onClickOutside);
+  }, []);
+
+  useEffect(() => {
+    const query = input.location.trim();
+    if (query.length < 2 || parseCoordinates(query)) {
+      locationSuggestAbortRef.current?.abort();
+      setLocationSuggestions([]);
+      setIsSuggestingLocation(false);
+      return;
+    }
+
+    const timeoutId = window.setTimeout(async () => {
+      locationSuggestAbortRef.current?.abort();
+      const controller = new AbortController();
+      locationSuggestAbortRef.current = controller;
+      setIsSuggestingLocation(true);
+
+      try {
+        const response = await fetch(
+          `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=6&addressdetails=1&q=${encodeURIComponent(query)}`,
+          {
+            method: "GET",
+            signal: controller.signal
+          }
+        );
+
+        if (!response.ok) {
+          setLocationSuggestions([]);
+          return;
+        }
+
+        const data = (await response.json()) as Array<{ display_name?: string }>;
+        const next = data
+          .map((item) => (item.display_name || "").trim())
+          .filter(Boolean)
+          .slice(0, 6)
+          .map((name) => ({ label: name, value: name }));
+
+        setLocationSuggestions(next);
+        setIsLocationSuggestionOpen(next.length > 0);
+      } catch {
+        setLocationSuggestions([]);
+      } finally {
+        setIsSuggestingLocation(false);
+      }
+    }, 250);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [input.location]);
+
+  const clearFieldError = (field: FormField) => {
+    setFormErrors((prev) => {
+      if (!prev[field]) {
+        return prev;
+      }
+      const next = { ...prev };
+      delete next[field];
+      return next;
+    });
+  };
+
+  const validateForm = (value: SurvivalInput): FormErrors => {
+    const errors: FormErrors = {};
+    const location = value.location.trim();
+    const notes = value.tacticalNuances.trim();
+    const detailValues = Object.values(value.priorityDetails ?? {});
+
+    if (!location) {
+      errors.location = "Location is required.";
+    } else if (location.length < 2) {
+      errors.location = "Location must be at least 2 characters.";
+    }
+
+    if (!Number.isFinite(value.credits) || value.credits < 0) {
+      errors.credits = "Budget must be a non-negative number.";
+    } else if (value.credits > 10000) {
+      errors.credits = "Budget looks too high (max 10000).";
+    }
+
+    if (!Number.isFinite(value.extractionTime) || value.extractionTime <= 0) {
+      errors.extractionTime = "Available time must be greater than 0 minutes.";
+    } else if (value.extractionTime > 1440) {
+      errors.extractionTime = "Available time cannot exceed 1440 minutes.";
+    }
+
+    if (!Number.isFinite(value.energyLevel) || value.energyLevel < 0 || value.energyLevel > 100) {
+      errors.energyLevel = "Energy reserve must be between 0% and 100%.";
+    }
+
+    if (!Array.isArray(value.priorities) || value.priorities.length === 0) {
+      errors.priorities = "Select at least one survival priority.";
+    }
+
+    if (notes.length > 500) {
+      errors.tacticalNuances = "Additional context must be 500 characters or fewer.";
+    }
+
+    if (detailValues.some((detail) => detail.trim().length > 200)) {
+      errors.priorityDetails = "Each advanced parameter must be 200 characters or fewer.";
+    }
+
+    return errors;
+  };
+
+  const validateLocation = async (
+    locationInput: string,
+    options: { force?: boolean } = {}
+  ): Promise<boolean> => {
+    const location = locationInput.trim();
+    if (!location) {
+      setLocationStatus("invalid");
+      setLocationStatusText("Location is required.");
+      return false;
+    }
+
+    if (!options.force && location === lastValidatedLocation && locationStatus === "valid") {
+      return true;
+    }
+
+    const coords = parseCoordinates(location);
+    if (coords) {
+      setLocationStatus("valid");
+      setLocationStatusText(`Coordinates verified (${coords.lat.toFixed(4)}, ${coords.lng.toFixed(4)})`);
+      setLastValidatedLocation(location);
+      return true;
+    }
+
+    const requestId = ++validationRequestId.current;
+    setLocationStatus("validating");
+    setLocationStatusText("Validating location...");
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 7000);
+
+    try {
+      const response = await fetch(
+        `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${encodeURIComponent(location)}`,
+        {
+          method: "GET",
+          signal: controller.signal
+        }
+      );
+
+      if (requestId !== validationRequestId.current) {
+        return false;
+      }
+
+      if (!response.ok) {
+        setLocationStatus("invalid");
+        setLocationStatusText("Could not validate location right now.");
+        return false;
+      }
+
+      const data = (await response.json()) as Array<{ display_name?: string; lat?: string; lon?: string }>;
+      const first = data?.[0];
+
+      if (!first?.lat || !first?.lon) {
+        setLocationStatus("invalid");
+        setLocationStatusText("Enter a real place or valid coordinates.");
+        return false;
+      }
+
+      setLocationStatus("valid");
+      setLocationStatusText(first.display_name ? `Validated: ${first.display_name}` : "Location validated.");
+      setLastValidatedLocation(location);
+      return true;
+    } catch {
+      if (requestId !== validationRequestId.current) {
+        return false;
+      }
+      setLocationStatus("invalid");
+      setLocationStatusText("Location validation failed. Check spelling or use coordinates.");
+      return false;
+    } finally {
+      clearTimeout(timeout);
+    }
+  };
 
   const handleAutoDetect = () => {
     if (!navigator.geolocation) {
-      setError("Geolocation is not supported by your browser.");
+      setSubmitError("Geolocation is not supported by your browser.");
       return;
     }
 
     setIsDetecting(true);
+    setSubmitError(null);
     navigator.geolocation.getCurrentPosition(
-      (position) => {
+      async (position) => {
         const { latitude, longitude } = position.coords;
-        setInput(prev => ({
+        let resolvedLocation = `LAT: ${latitude.toFixed(4)}, LON: ${longitude.toFixed(4)}`;
+
+        try {
+          const response = await fetch(
+            `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${latitude}&lon=${longitude}`,
+            { signal: AbortSignal.timeout(7000) }
+          );
+          if (response.ok) {
+            const data = await response.json();
+            const label = reverseLabelFromNominatim(data);
+            if (label) {
+              resolvedLocation = label;
+            }
+          }
+        } catch {
+          // Keep coordinate fallback if reverse geocoding fails.
+        }
+
+        setInput((prev) => ({
           ...prev,
-          location: `LAT: ${latitude.toFixed(4)}, LON: ${longitude.toFixed(4)}`
+          location: resolvedLocation
         }));
+        clearFieldError("location");
+        const valid = await validateLocation(resolvedLocation, { force: true });
+        if (!valid) {
+          setFormErrors((prev) => ({
+            ...prev,
+            location: "Auto-detected location could not be validated. Please edit manually."
+          }));
+        }
         setIsDetecting(false);
       },
       (err) => {
         console.error(err);
-        setError("Unable to retrieve your location. Please enter it manually.");
+        if (err.code === 1) {
+          setSubmitError("Location permission denied. Please allow browser location access.");
+        } else if (err.code === 2) {
+          setSubmitError("Unable to detect your current location. Try again or enter it manually.");
+        } else if (err.code === 3) {
+          setSubmitError("Location detection timed out. Please retry.");
+        } else {
+          setSubmitError("Unable to retrieve your location. Please enter it manually.");
+        }
         setIsDetecting(false);
+      },
+      {
+        enableHighAccuracy: true,
+        timeout: 10000,
+        maximumAge: 0
       }
     );
   };
@@ -117,14 +440,31 @@ export default function Planner() {
   };
 
   const handleGenerate = async () => {
+    const validationErrors = validateForm(input);
+    setFormErrors(validationErrors);
+    if (Object.keys(validationErrors).length > 0) {
+      setSubmitError("Please fix the highlighted fields before generating a plan.");
+      return;
+    }
+
+    const isLocationValid = await validateLocation(input.location, { force: true });
+    if (!isLocationValid) {
+      setFormErrors((prev) => ({
+        ...prev,
+        location: "Enter a valid location name or coordinates before generating."
+      }));
+      setSubmitError("Please fix the highlighted fields before generating a plan.");
+      return;
+    }
+
     setIsLoading(true);
-    setError(null);
+    setSubmitError(null);
     try {
       const plan = await generateSurvivalPlan(input);
       navigate('/result', { state: { plan } });
     } catch (err) {
       console.error(err);
-      setError("Failed to initialize survival protocol. System error detected.");
+      setSubmitError("Failed to initialize survival protocol. System error detected.");
     } finally {
       setIsLoading(false);
     }
@@ -151,29 +491,28 @@ export default function Planner() {
     );
   }
 
-  if (error) {
-    return (
-      <div className="h-[70vh] flex flex-col items-center justify-center space-y-8">
-        <div className="w-20 h-20 bg-error-container/10 border border-error-container/30 rounded-full flex items-center justify-center neon-glow-ember">
-          <AlertTriangle className="text-error" size={40} />
-        </div>
-        <div className="text-center space-y-4 max-w-md">
-          <h2 className="text-2xl font-display font-bold text-error uppercase tracking-widest">Protocol Failure</h2>
-          <p className="text-sm text-on-surface-variant font-mono">{error}</p>
-          <Button variant="ember" onClick={() => setError(null)}>Retry Initialization</Button>
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div className="max-w-7xl mx-auto py-8 px-4">
       {/* Header */}
       <header className="mb-12 relative pl-6">
         <div className="absolute left-0 top-0 w-1 h-full bg-primary rounded-full" />
+        <img
+          src="/assets/icons/thiings/futuristic-caveman/motif-primitive-core.png"
+          alt=""
+          aria-hidden="true"
+          className="absolute -right-2 -top-2 w-14 h-14 opacity-25"
+        />
         <h1 className="font-display text-5xl md:text-6xl font-bold tracking-tight mb-4 text-on-surface">
           Survival <span className="text-primary">Planner</span>
         </h1>
+        <div className="absolute right-4 top-16 hidden md:block">
+          <img
+            src="/assets/icons/thiings/futuristic-caveman/totem-pole.png"
+            alt=""
+            aria-hidden="true"
+            className="pointer-events-none w-24 h-24 object-contain opacity-[0.14] motif-float"
+          />
+        </div>
         <p className="font-sans text-on-surface-variant max-w-2xl text-lg">
           Configure your survival protocol. Input your environmental parameters to generate a custom tactical plan.
         </p>
@@ -182,47 +521,88 @@ export default function Planner() {
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
         {/* Left Column: Form */}
         <div className="lg:col-span-7 space-y-6">
-          {/* Location Card */}
-          <Card variant="surface" className="flex flex-col gap-4 border-none bg-surface-container/50">
+          {/* Location Section */}
+          <section className="flex flex-col gap-4">
             <div className="flex flex-col gap-1">
               <h2 className="text-on-surface font-display text-xl font-bold">Location Matrix</h2>
               <p className="text-on-surface-variant font-sans text-sm">Where are you currently stationed?</p>
             </div>
-            <div className="flex flex-col gap-2">
-              <div className="flex items-center gap-3 p-4 rounded-2xl bg-inverse-on-surface border border-outline-variant/30">
-                <MapPin className="text-primary" size={20} />
+            <div className="flex flex-col gap-2" ref={locationSuggestBoxRef}>
+              <div className="relative flex items-center gap-3 p-4 rounded-2xl bg-inverse-on-surface border border-outline-variant/30">
+                <MapPin
+                  key={`${locationVisualStatus}-${locationStatusAnimTick}`}
+                  className={cn(locationIconClass, "location-status-bounce")}
+                  size={20}
+                />
                 <input 
                   type="text"
                   value={input.location}
-                  onChange={(e) => setInput({ ...input, location: e.target.value })}
+                  onChange={(e) => {
+                    setInput({ ...input, location: e.target.value });
+                    clearFieldError("location");
+                    setLocationStatus("idle");
+                    setLocationStatusText("");
+                    setLastValidatedLocation("");
+                    setIsLocationSuggestionOpen(true);
+                  }}
+                  onFocus={() => {
+                    if (locationSuggestions.length > 0) {
+                      setIsLocationSuggestionOpen(true);
+                    }
+                  }}
+                  onBlur={() => {
+                    if (input.location.trim()) {
+                      void validateLocation(input.location);
+                    }
+                  }}
                   placeholder="Enter coordinates or sector name..."
-                  className="bg-transparent border-none focus:ring-0 text-on-surface font-sans w-full outline-none"
+                  className="bg-transparent border-none focus:ring-0 text-on-surface font-sans w-full outline-none pr-36"
                 />
+                <button
+                  type="button"
+                  onClick={handleAutoDetect}
+                  disabled={isDetecting}
+                  className="absolute right-4 inline-flex items-center gap-1.5 text-xs font-semibold text-on-surface-variant hover:text-primary transition-colors disabled:opacity-50"
+                >
+                  <Navigation className={cn("transition-transform", isDetecting && "animate-spin")} size={14} />
+                  <span>{isDetecting ? "Detecting..." : "Auto-Detect"}</span>
+                </button>
+                {isLocationSuggestionOpen && (locationSuggestions.length > 0 || isSuggestingLocation) && (
+                  <div className="absolute z-30 left-0 right-0 top-[calc(100%+8px)] rounded-2xl border border-outline-variant bg-white shadow-lg overflow-hidden">
+                    {isSuggestingLocation ? (
+                      <div className="px-4 py-3 text-sm text-on-surface-variant flex items-center gap-2">
+                        <Loader2 size={14} className="animate-spin" />
+                        Searching places...
+                      </div>
+                    ) : (
+                      <ul className="max-h-64 overflow-y-auto">
+                        {locationSuggestions.map((suggestion) => (
+                          <li key={suggestion.value}>
+                            <button
+                              type="button"
+                              onMouseDown={(e) => {
+                                e.preventDefault();
+                                setInput((prev) => ({ ...prev, location: suggestion.value }));
+                                clearFieldError("location");
+                                setLocationStatus("idle");
+                                setLocationStatusText("");
+                                setLastValidatedLocation("");
+                                setIsLocationSuggestionOpen(false);
+                              }}
+                              className="w-full px-4 py-3 text-left text-sm text-on-surface-variant hover:bg-surface-variant hover:text-on-surface transition-colors"
+                            >
+                              {suggestion.label}
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                )}
               </div>
-              <button 
-                onClick={handleAutoDetect}
-                disabled={isDetecting}
-                className="flex items-center justify-center gap-2 p-4 rounded-2xl bg-secondary-container text-on-secondary-container hover:bg-secondary transition-colors group disabled:opacity-50"
-              >
-                <Navigation className={cn("transition-transform", isDetecting && "animate-spin")} size={18} />
-                <span className="font-sans font-bold text-sm">
-                  {isDetecting ? "Detecting..." : "Auto-Detect Location"}
-                </span>
-              </button>
             </div>
-            <div className="mt-2 h-32 rounded-2xl overflow-hidden relative border border-outline-variant">
-              <img 
-                src="https://picsum.photos/seed/terrain/800/400" 
-                alt="Tactical Map" 
-                className="w-full h-full object-cover opacity-40 grayscale contrast-125"
-                referrerPolicy="no-referrer"
-              />
-              <div className="absolute inset-0 bg-gradient-to-t from-surface-container to-transparent" />
-              <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2">
-                <span className="material-symbols-outlined text-error text-4xl animate-pulse">target</span>
-              </div>
-            </div>
-          </Card>
+            {formErrors.location && <p className="text-xs text-error mt-1">{formErrors.location}</p>}
+          </section>
 
           {/* Resource Card */}
           <Card variant="surface" className="flex flex-col gap-4 border-none bg-surface-container/50">
@@ -238,11 +618,18 @@ export default function Planner() {
                   <input 
                     type="number"
                     value={input.credits}
-                    onChange={(e) => setInput({ ...input, credits: parseInt(e.target.value) || 0 })}
+                    min={0}
+                    max={10000}
+                    step={1}
+                    onChange={(e) => {
+                      setInput({ ...input, credits: parseInt(e.target.value, 10) || 0 });
+                      clearFieldError("credits");
+                    }}
                     className="bg-transparent border-none focus:ring-0 text-on-surface font-sans w-full outline-none"
                     placeholder="0.00"
                   />
                 </div>
+                {formErrors.credits && <p className="text-xs text-error mt-1">{formErrors.credits}</p>}
               </div>
               <div className="flex flex-col gap-2">
                 <label className="text-on-surface-variant font-sans text-[10px] uppercase tracking-widest font-bold">Extraction Time (Min)</label>
@@ -251,11 +638,18 @@ export default function Planner() {
                   <input 
                     type="number"
                     value={input.extractionTime}
-                    onChange={(e) => setInput({ ...input, extractionTime: parseInt(e.target.value) || 0 })}
+                    min={1}
+                    max={1440}
+                    step={1}
+                    onChange={(e) => {
+                      setInput({ ...input, extractionTime: parseInt(e.target.value, 10) || 0 });
+                      clearFieldError("extractionTime");
+                    }}
                     className="bg-transparent border-none focus:ring-0 text-on-surface font-sans w-full outline-none"
                     placeholder="60"
                   />
                 </div>
+                {formErrors.extractionTime && <p className="text-xs text-error mt-1">{formErrors.extractionTime}</p>}
               </div>
             </div>
             <div className="mt-4 space-y-4">
@@ -277,9 +671,13 @@ export default function Planner() {
               <input 
                 type="range" min="0" max="100" step="10"
                 value={input.energyLevel}
-                onChange={(e) => setInput({ ...input, energyLevel: parseInt(e.target.value) })}
+                onChange={(e) => {
+                  setInput({ ...input, energyLevel: parseInt(e.target.value, 10) });
+                  clearFieldError("energyLevel");
+                }}
                 className="w-full h-1 bg-outline-variant rounded-lg appearance-none cursor-pointer accent-primary mt-2"
               />
+              {formErrors.energyLevel && <p className="text-xs text-error mt-1">{formErrors.energyLevel}</p>}
             </div>
           </Card>
 
@@ -297,7 +695,10 @@ export default function Planner() {
                 return (
                   <div key={opt.id} className="relative group/card">
                     <button
-                      onClick={() => togglePriority(opt.id)}
+                      onClick={() => {
+                        togglePriority(opt.id);
+                        clearFieldError("priorities");
+                      }}
                       className={cn(
                         "w-full p-4 rounded-2xl flex flex-col gap-2 border transition-all relative",
                         isActive 
@@ -374,86 +775,96 @@ export default function Planner() {
                 );
               })}
             </div>
+            {formErrors.priorities && <p className="text-xs text-error mt-1">{formErrors.priorities}</p>}
+            {formErrors.priorityDetails && <p className="text-xs text-error mt-1">{formErrors.priorityDetails}</p>}
 
             {/* Advanced Options Modal/Overlay */}
-            <AnimatePresence>
-              {activeAdvancedPriority && (
-                <motion.div
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  exit={{ opacity: 0 }}
-                  className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[100] flex items-center justify-center p-4"
-                  onClick={() => setActiveAdvancedPriority(null)}
-                >
-                  <motion.div
-                    initial={{ scale: 0.9, y: 20 }}
-                    animate={{ scale: 1, y: 0 }}
-                    exit={{ scale: 0.9, y: 20 }}
-                    className="w-full max-w-md bg-surface-container rounded-3xl border border-outline-variant shadow-2xl overflow-hidden"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    <div className="p-6 border-b border-outline-variant flex justify-between items-center bg-surface">
-                      <div className="flex items-center gap-3">
-                        <span className="material-symbols-outlined text-primary">
-                          {priorityOptions.find(o => o.id === activeAdvancedPriority)?.icon}
-                        </span>
-                        <h3 className="font-display text-xl font-bold uppercase tracking-widest text-on-surface">
-                          {priorityOptions.find(o => o.id === activeAdvancedPriority)?.label} <span className="text-primary">Parameters</span>
-                        </h3>
-                      </div>
-                      <button 
-                        onClick={() => setActiveAdvancedPriority(null)}
-                        className="p-2 rounded-full hover:bg-inverse-on-surface transition-colors text-on-surface-variant"
+            {typeof document !== "undefined" &&
+              createPortal(
+                <AnimatePresence>
+                  {activeAdvancedPriority && (
+                    <motion.div
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      exit={{ opacity: 0 }}
+                      className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[9999] flex items-center justify-center p-4"
+                      onClick={() => setActiveAdvancedPriority(null)}
+                    >
+                      <motion.div
+                        initial={{ scale: 0.9, y: 20 }}
+                        animate={{ scale: 1, y: 0 }}
+                        exit={{ scale: 0.9, y: 20 }}
+                        className="w-full max-w-md bg-surface-container rounded-3xl border border-outline-variant shadow-2xl overflow-hidden"
+                        onClick={(e) => e.stopPropagation()}
                       >
-                        <X size={20} />
-                      </button>
-                    </div>
-                    
-                    <div className="p-8 space-y-6">
-                      <div className="space-y-2">
-                        <label className="text-[10px] font-display font-bold uppercase tracking-[0.2em] text-primary">Specific Requirements</label>
-                        <p className="text-xs text-on-surface-variant font-sans mb-4">
-                          Detail your specific needs for {priorityOptions.find(o => o.id === activeAdvancedPriority)?.label.toLowerCase()}. 
-                          The AI will prioritize these nuances in your plan.
-                        </p>
-                        <div className="bg-inverse-on-surface border border-outline-variant rounded-2xl p-4 focus-within:border-primary transition-colors">
-                          <textarea
-                            autoFocus
-                            value={input.priorityDetails?.[activeAdvancedPriority] || ''}
-                            onChange={(e) => updatePriorityDetail(activeAdvancedPriority, e.target.value)}
-                            className="w-full bg-transparent border-none focus:ring-0 text-on-surface font-sans text-sm outline-none h-32 resize-none placeholder:text-on-surface-variant/30"
-                            placeholder={`e.g., "High protein only", "Stealthy location", "Fast Wi-Fi required"...`}
-                          />
+                        <div className="p-6 border-b border-outline-variant flex justify-between items-center bg-surface">
+                          <div className="flex items-center gap-3">
+                            <span className="material-symbols-outlined text-primary">
+                              {priorityOptions.find(o => o.id === activeAdvancedPriority)?.icon}
+                            </span>
+                            <h3 className="font-display text-xl font-bold uppercase tracking-widest text-on-surface">
+                              {priorityOptions.find(o => o.id === activeAdvancedPriority)?.label} <span className="text-primary">Parameters</span>
+                            </h3>
+                          </div>
+                          <button
+                            onClick={() => setActiveAdvancedPriority(null)}
+                            className="p-2 rounded-full hover:bg-inverse-on-surface transition-colors text-on-surface-variant"
+                          >
+                            <X size={20} />
+                          </button>
                         </div>
-                      </div>
 
-                      <div className="flex gap-3">
-                        <Button 
-                          className="flex-1" 
-                          onClick={() => {
-                            if (!input.priorities.includes(activeAdvancedPriority)) {
-                              togglePriority(activeAdvancedPriority);
-                            }
-                            setActiveAdvancedPriority(null);
-                          }}
-                        >
-                          Save Parameters
-                        </Button>
-                        <Button 
-                          variant="outline" 
-                          onClick={() => {
-                            updatePriorityDetail(activeAdvancedPriority, '');
-                            setActiveAdvancedPriority(null);
-                          }}
-                        >
-                          Clear
-                        </Button>
-                      </div>
-                    </div>
-                  </motion.div>
-                </motion.div>
+                        <div className="p-8 space-y-6">
+                          <div className="space-y-2">
+                            <label className="text-[10px] font-display font-bold uppercase tracking-[0.2em] text-primary">Specific Requirements</label>
+                            <p className="text-xs text-on-surface-variant font-sans mb-4">
+                              Detail your specific needs for {priorityOptions.find(o => o.id === activeAdvancedPriority)?.label.toLowerCase()}.
+                              The AI will prioritize these nuances in your plan.
+                            </p>
+                            <div className="bg-inverse-on-surface border border-outline-variant rounded-2xl p-4 focus-within:border-primary transition-colors">
+                              <textarea
+                                autoFocus
+                                value={input.priorityDetails?.[activeAdvancedPriority] || ''}
+                                maxLength={200}
+                                onChange={(e) => {
+                                  updatePriorityDetail(activeAdvancedPriority, e.target.value);
+                                  clearFieldError("priorityDetails");
+                                }}
+                                className="w-full bg-transparent border-none focus:ring-0 text-on-surface font-sans text-sm outline-none h-32 resize-none placeholder:text-on-surface-variant/30"
+                                placeholder={`e.g., "High protein only", "Stealthy location", "Fast Wi-Fi required"...`}
+                              />
+                            </div>
+                          </div>
+
+                          <div className="flex gap-3">
+                            <Button
+                              className="flex-1"
+                              onClick={() => {
+                                if (!input.priorities.includes(activeAdvancedPriority)) {
+                                  togglePriority(activeAdvancedPriority);
+                                }
+                                setActiveAdvancedPriority(null);
+                              }}
+                            >
+                              Save Parameters
+                            </Button>
+                            <Button
+                              variant="outline"
+                              onClick={() => {
+                                updatePriorityDetail(activeAdvancedPriority, '');
+                                setActiveAdvancedPriority(null);
+                              }}
+                            >
+                              Clear
+                            </Button>
+                          </div>
+                        </div>
+                      </motion.div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>,
+                document.body
               )}
-            </AnimatePresence>
           </Card>
 
           {/* Notes Card */}
@@ -465,17 +876,28 @@ export default function Planner() {
             <div className="flex items-center gap-3 p-4 rounded-2xl bg-inverse-on-surface border border-outline-variant/30">
               <textarea 
                 value={input.tacticalNuances}
-                onChange={(e) => setInput({ ...input, tacticalNuances: e.target.value })}
+                maxLength={500}
+                onChange={(e) => {
+                  setInput({ ...input, tacticalNuances: e.target.value });
+                  clearFieldError("tacticalNuances");
+                }}
                 className="bg-transparent border-none focus:ring-0 text-on-surface font-sans w-full outline-none h-32 resize-none"
                 placeholder="e.g., 'Indoor only', 'Stealth required', 'Near public transit'..."
               />
             </div>
+            {formErrors.tacticalNuances && <p className="text-xs text-error mt-1">{formErrors.tacticalNuances}</p>}
           </Card>
         </div>
 
         {/* Right Column: Live Summary Panel */}
         <aside className="lg:col-span-5 sticky top-24">
           <div className="bg-surface-container rounded-3xl p-8 shadow-xl overflow-hidden relative border border-outline-variant/30">
+            <img
+              src="/assets/icons/thiings/futuristic-caveman/motif-cave-grid.png"
+              alt=""
+              aria-hidden="true"
+              className="absolute right-2 top-2 w-16 h-16 opacity-20"
+            />
             <div className="flex justify-between items-start mb-8 relative z-10">
               <div>
                 <h3 className="font-display text-2xl font-bold text-on-surface tracking-tight">Plan Summary</h3>
@@ -509,7 +931,7 @@ export default function Planner() {
                 <div className="flex flex-wrap gap-2">
                   {input.priorities.length > 0 ? (
                     input.priorities.map(p => (
-                      <span key={p} className="bg-primary/10 text-primary text-[10px] font-bold uppercase tracking-widest py-1.5 px-3 rounded-lg border border-primary/20">
+                      <span key={p} className="chip chip-soft">
                         {priorityOptions.find(o => o.id === p)?.label}
                       </span>
                     ))
@@ -536,23 +958,38 @@ export default function Planner() {
 
           {/* Submit Area */}
           <div className="mt-8 space-y-4">
+            {submitError && (
+              <div className="w-full p-4 rounded-2xl border border-error/40 bg-error-container/10 text-error text-sm font-medium flex items-start gap-2">
+                <AlertTriangle size={16} className="shrink-0 mt-0.5" />
+                <span>{submitError}</span>
+              </div>
+            )}
             <button 
               onClick={handleGenerate}
-              className="w-full py-6 rounded-3xl font-display font-bold text-xl tracking-tight text-on-primary bg-primary shadow-lg hover:shadow-xl hover:scale-[1.01] active:scale-95 transition-all duration-300 flex items-center justify-center gap-3"
+              disabled={isLoading || isDetecting || locationStatus === "validating"}
+              className="w-full py-6 rounded-3xl font-display font-bold text-xl tracking-tight text-on-primary bg-primary shadow-lg hover:shadow-xl hover:scale-[1.01] active:scale-95 transition-all duration-300 flex items-center justify-center gap-3 disabled:opacity-60 disabled:cursor-not-allowed disabled:hover:scale-100"
             >
               <Zap size={20} />
               Generate Survival Plan
             </button>
             <div className="flex gap-4">
               <button 
-                onClick={() => setInput({
-                  location: '',
-                  credits: 0,
-                  extractionTime: 0,
-                  energyLevel: 50,
-                  priorities: [],
-                  tacticalNuances: '',
-                })}
+                onClick={() => {
+                  setInput({
+                    location: '',
+                    credits: 0,
+                    extractionTime: 0,
+                    energyLevel: 50,
+                    priorities: [],
+                    priorityDetails: {},
+                    tacticalNuances: '',
+                  });
+                  setFormErrors({});
+                  setSubmitError(null);
+                  setLocationStatus("idle");
+                  setLocationStatusText("");
+                  setLastValidatedLocation("");
+                }}
                 className="flex-1 py-4 rounded-2xl font-sans text-sm font-bold text-on-surface-variant hover:text-on-surface bg-inverse-on-surface border border-outline-variant/30 transition-colors flex items-center justify-center gap-2"
               >
                 <RefreshCcw size={16} />

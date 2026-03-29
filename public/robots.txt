@@ -1,4 +1,6 @@
 User-agent: *
 Allow: /
+Disallow: /result/
 
-Sitemap: https://ais-pre-gh4avl3m3jxhqsb5g4fm2i-296050977906.us-east1.run.app/sitemap.xml
+Sitemap: https://your-frontend-domain.com/sitemap.xml
+Host: https://your-frontend-domain.com
